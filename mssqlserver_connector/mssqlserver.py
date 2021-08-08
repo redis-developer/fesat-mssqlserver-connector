@@ -87,7 +87,7 @@ class MsSqlServerOfflineStore(OfflineStore):
                 SELECT {field_string},
                 ROW_NUMBER() OVER({partition_by_join_key_string} ORDER BY {timestamp_desc_string}) AS _feast_row
                 FROM {from_expression} inner_t
-                WHERE {event_timestamp_column} BETWEEN CONVERT(DATETIME2, '{start_date}', 120) AND CONVERT(DATETIME2, '{end_date}', 120)
+                WHERE {event_timestamp_column} BETWEEN CONVERT(DATETIMEOFFSET, '{start_date}', 120) AND CONVERT(DATETIMEOFFSET, '{end_date}', 120)
             ) outer_t
             WHERE outer_t._feast_row = 1
             """
@@ -191,7 +191,7 @@ def _infer_event_timestamp_from_sqlserver_schema(table_schema) -> str:
     else:
         datetime_columns = list(
             filter(
-                lambda schema_field: schema_field["DATA_TYPE"] == "DATETIME",
+                lambda schema_field: schema_field["DATA_TYPE"] == "DATETIMEOFFSET",
                 table_schema,
             )
         )
@@ -213,10 +213,10 @@ class MsSqlServerRetrievalJob(RetrievalJob):
         self.engine = engine
 
     def to_df(self):
-        return pandas.read_sql(self.query, con=self.engine)
+        return pandas.read_sql(self.query, con=self.engine).fillna(value=np.nan)
 
     def to_arrow(self) -> pyarrow.Table:
-        result = pandas.read_sql(self.query, con=self.engine)
+        result = pandas.read_sql(self.query, con=self.engine).fillna(value=np.nan)
         return pyarrow.Table.from_pandas(result)
 
 
@@ -362,18 +362,29 @@ MULTIPLE_FEATURE_VIEW_POINT_IN_TIME_JOIN = """
  all the logic as the field to GROUP BY the data
 */
 WITH entity_dataframe AS (
-    SELECT
-        *,
-        CONCAT(
-            {% for entity_key in unique_entity_keys %}
-                {{entity_key}},
-            {% endfor %}
-            {{entity_df_event_timestamp_col}}
-        ) AS entity_row_unique_id
+    SELECT *,
+        {{entity_df_event_timestamp_col}} AS entity_timestamp
+        {% for featureview in featureviews %}
+            ,CONCAT(
+                {% for entity_key in unique_entity_keys %}
+                    {{entity_key}},
+                {% endfor %}
+                {{entity_df_event_timestamp_col}}
+            ) AS {{featureview.name}}__entity_row_unique_id
+        {% endfor %}
     FROM {{ left_table_query_string }}
 ),
 
 {% for featureview in featureviews %}
+
+{{ featureview.name }}__entity_dataframe AS (
+    SELECT
+        {{ featureview.entities | join(', ')}},
+        entity_timestamp,
+        {{featureview.name}}__entity_row_unique_id
+    FROM entity_dataframe
+    GROUP BY {{ featureview.entities | join(', ')}}, entity_timestamp, {{featureview.name}}__entity_row_unique_id
+),
 
 /*
  This query template performs the point-in-time correctness join for a single feature set table
@@ -401,19 +412,24 @@ WITH entity_dataframe AS (
             {{ feature }} as {% if full_feature_names %}{{ featureview.name }}__{{feature}}{% else %}{{ feature }}{% endif %}{% if loop.last %}{% else %}, {% endif %}
         {% endfor %}
     FROM {{ featureview.table_subquery }} t
+    WHERE {{ featureview.event_timestamp_column }} <= (SELECT MAX(entity_timestamp) FROM entity_dataframe)
+    {% if featureview.ttl == 0 %}{% else %}
+    AND {{ featureview.ttl }} >= DATEDIFF(SECOND, {{ featureview.event_timestamp_column }}, (SELECT MIN(entity_timestamp) FROM entity_dataframe) )
+    {% endif %}
 ),
 
 {{ featureview.name }}__base AS (
     SELECT
         subquery.*,
         entity_dataframe.{{entity_df_event_timestamp_col}} AS entity_timestamp,
-        entity_dataframe.entity_row_unique_id
+        entity_dataframe.{{featureview.name}}__entity_row_unique_id
     FROM {{ featureview.name }}__subquery AS subquery
     INNER JOIN entity_dataframe
-        ON subquery.event_timestamp <= entity_dataframe.{{entity_df_event_timestamp_col}}
+        ON 1=1
+        AND subquery.event_timestamp <= entity_dataframe.{{entity_df_event_timestamp_col}}
 
         {% if featureview.ttl == 0 %}{% else %}
-        AND DATEDIFF(SECOND, entity_dataframe.{{entity_df_event_timestamp_col}}, subquery.event_timestamp) <= {{ featureview.ttl }}
+        AND {{ featureview.ttl }} > = DATEDIFF(SECOND, subquery.event_timestamp, entity_dataframe.{{entity_df_event_timestamp_col}}) 
         {% endif %}
 
         {% for entity in featureview.entities %}
@@ -431,11 +447,11 @@ WITH entity_dataframe AS (
 {% if featureview.created_timestamp_column %}
 {{ featureview.name }}__dedup AS (
     SELECT
-        entity_row_unique_id,
+        {{featureview.name}}__entity_row_unique_id,
         event_timestamp,
         MAX(created_timestamp) as created_timestamp
     FROM {{ featureview.name }}__base
-    GROUP BY entity_row_unique_id, event_timestamp
+    GROUP BY {{featureview.name}}__entity_row_unique_id, event_timestamp
 ),
 {% endif %}
 
@@ -445,7 +461,7 @@ WITH entity_dataframe AS (
 */
 {{ featureview.name }}__latest AS (
     SELECT
-        {{ featureview.name }}__base.entity_row_unique_id,
+        {{ featureview.name }}__base.{{ featureview.name }}__entity_row_unique_id,
         MAX({{ featureview.name }}__base.event_timestamp) AS event_timestamp
         {% if featureview.created_timestamp_column %}
             ,MAX({{ featureview.name }}__base.created_timestamp) AS created_timestamp
@@ -454,12 +470,12 @@ WITH entity_dataframe AS (
     FROM {{ featureview.name }}__base
     {% if featureview.created_timestamp_column %}
         INNER JOIN {{ featureview.name }}__dedup
-        ON {{ featureview.name }}__dedup.entity_row_unique_id = {{ featureview.name }}__base.entity_row_unique_id
+        ON {{ featureview.name }}__dedup.{{ featureview.name }}__entity_row_unique_id = {{ featureview.name }}__base.{{ featureview.name }}__entity_row_unique_id
         AND {{ featureview.name }}__dedup.event_timestamp = {{ featureview.name }}__base.event_timestamp
         AND {{ featureview.name }}__dedup.created_timestamp = {{ featureview.name }}__base.created_timestamp
     {% endif %}
 
-    GROUP BY {{ featureview.name }}__base.entity_row_unique_id
+    GROUP BY {{ featureview.name }}__base.{{ featureview.name }}__entity_row_unique_id
 ),
 
 /*
@@ -470,7 +486,7 @@ WITH entity_dataframe AS (
     SELECT base.*
     FROM {{ featureview.name }}__base as base
     INNER JOIN {{ featureview.name }}__latest
-    ON base.entity_row_unique_id = {{ featureview.name }}__latest.entity_row_unique_id
+    ON base.{{ featureview.name }}__entity_row_unique_id = {{ featureview.name }}__latest.{{ featureview.name }}__entity_row_unique_id
     AND base.event_timestamp = {{ featureview.name }}__latest.event_timestamp
         {% if featureview.created_timestamp_column %}
             AND base.created_timestamp = {{ featureview.name }}__latest.created_timestamp
@@ -485,18 +501,19 @@ WITH entity_dataframe AS (
 
 SELECT *
 FROM entity_dataframe
-
 {% for featureview in featureviews %}
 LEFT JOIN (
     SELECT
-        entity_row_unique_id,
+        {{featureview.name}}__entity_row_unique_id
         {% for feature in featureview.features %}
-            {% if full_feature_names %}{{ featureview.name }}__{{feature}}{% else %}{{ feature }}{% endif %}{% if loop.last %}{% else %},{% endif %}
+            ,{% if full_feature_names %}{{ featureview.name }}__{{feature}}{% else %}{{ feature }}{% endif %}
         {% endfor %}
     FROM {{ featureview.name }}__cleaned
 ) {{ featureview.name }}__cleaned
 ON
-{{ featureview.name }}__cleaned.entity_row_unique_id = entity_dataframe.entity_row_unique_id
+{{ featureview.name }}__cleaned.{{ featureview.name }}__entity_row_unique_id = entity_dataframe.{{ featureview.name }}__entity_row_unique_id
 
 {% endfor %}
 """
+
+
