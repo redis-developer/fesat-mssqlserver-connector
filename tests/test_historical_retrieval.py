@@ -227,10 +227,10 @@ def test_historical_features_from_mssqlserver_sources(
     # will try to create "TIMESTAMP" columns, which don't work. We need DATETIME
     # columns.
     fields = {
-        "e_ts": sqlalchemy.DateTime(),
-        "event_timestamp": sqlalchemy.DateTime(),
-        "event_timestamp": sqlalchemy.DateTime(),
-        "created": sqlalchemy.DateTime(),
+        "e_ts":  sqlalchemy.dialects.mssql.DATETIMEOFFSET(),
+        "event_timestamp":  sqlalchemy.dialects.mssql.DATETIMEOFFSET(),
+        "event_timestamp":  sqlalchemy.dialects.mssql.DATETIMEOFFSET(),
+        "created":  sqlalchemy.dialects.mssql.DATETIMEOFFSET(),
     }
 
     start_date = datetime.now().replace(microsecond=0, second=0, minute=0)
