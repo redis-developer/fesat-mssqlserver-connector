@@ -343,7 +343,6 @@ def test_historical_features_from_mssqlserver_sources(
 
             # assert sorted(expected_df.columns) == sorted(actual_df_from_sql_entities.columns)
 
-            # XXX: Why aren't the frames equal?
             assert_frame_equal(
                 expected_df.sort_values(
                     by=[event_timestamp, "order_id", "driver_id", "customer_id"]

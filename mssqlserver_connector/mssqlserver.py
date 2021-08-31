@@ -499,7 +499,12 @@ WITH entity_dataframe AS (
  The entity_dataframe dataset being our source of truth here.
  */
 
-SELECT *
+SELECT entity_dataframe.*
+{% for featureview in featureviews %}
+    {% for feature in featureview.features %}   
+            ,{% if full_feature_names %}{{ featureview.name }}__{{feature}}{% else %}{{ feature }}{% endif %}
+    {% endfor %}
+{% endfor %}
 FROM entity_dataframe
 {% for featureview in featureviews %}
 LEFT JOIN (
@@ -512,7 +517,6 @@ LEFT JOIN (
 ) {{ featureview.name }}__cleaned
 ON
 {{ featureview.name }}__cleaned.{{ featureview.name }}__entity_row_unique_id = entity_dataframe.{{ featureview.name }}__entity_row_unique_id
-
 {% endfor %}
 """
 
